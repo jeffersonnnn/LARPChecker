@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:latest
+    container_name: larpcheck_db
+    environment:
+      POSTGRES_USER: larpcheck
+      POSTGRES_PASSWORD: larpcheck_password
+      POSTGRES_DB: larpcheck
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data: 
