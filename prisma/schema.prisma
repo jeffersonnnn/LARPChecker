@@ -1,9 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -14,12 +8,13 @@ datasource db {
 }
 
 model User {
-  id            String    @id @default(uuid())
-  twitterId     String    @unique
-  username      String
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  analyses      Analysis[]
+  id        String     @id @default(uuid())
+  twitterId String     @unique
+  username  String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  analyses  Analysis[]
+  requests  AnalysisQueue[]
 }
 
 model Analysis {
@@ -27,8 +22,130 @@ model Analysis {
   repositoryUrl String
   result        String    @db.Text
   isLarp        Boolean
+  status        AnalysisStatus @default(COMPLETED)
   createdAt     DateTime  @default(now())
   userId        String
   user          User      @relation(fields: [userId], references: [id])
   cacheExpiry   DateTime?
+  metadata      RepositoryMetadata? @relation(fields: [repositoryUrl], references: [url])
+}
+
+model AnalysisQueue {
+  id            String    @id @default(uuid())
+  repositoryUrl String
+  status        QueueStatus @default(PENDING)
+  priority      Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  startedAt     DateTime?
+  completedAt   DateTime?
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  error         String?   @db.Text
+  metadata      RepositoryMetadata? @relation(fields: [repositoryUrl], references: [url])
+}
+
+model RepositoryMetadata {
+  id            String    @id @default(uuid())
+  url           String    @unique
+  owner         String
+  name          String
+  description   String?   @db.Text
+  stars         Int       @default(0)
+  forks         Int       @default(0)
+  issues        Int       @default(0)
+  size          Int       @default(0)
+  lastCommit    DateTime?
+  contributors  Int       @default(0)
+  topics        String[]  @default([])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  analyses      Analysis[]
+  queueItems    AnalysisQueue[]
+  commits       Commit[]
+  dependencies  Dependency[]
+  languages     Language[]
+}
+
+model Commit {
+  id            String    @id @default(uuid())
+  sha           String    @unique
+  message       String    @db.Text
+  author        String
+  timestamp     DateTime
+  additions     Int
+  deletions     Int
+  files         Int
+  repository    RepositoryMetadata @relation(fields: [repositoryUrl], references: [url])
+  repositoryUrl String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([repositoryUrl])
+}
+
+model Dependency {
+  id            String    @id @default(uuid())
+  name          String
+  version       String
+  type          DependencyType
+  source        String
+  repository    RepositoryMetadata @relation(fields: [repositoryUrl], references: [url])
+  repositoryUrl String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([repositoryUrl])
+  @@unique([repositoryUrl, name, version])
+}
+
+model Language {
+  id            String    @id @default(uuid())
+  name          String
+  bytes         Int
+  repository    RepositoryMetadata @relation(fields: [repositoryUrl], references: [url])
+  repositoryUrl String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([repositoryUrl])
+  @@unique([repositoryUrl, name])
+}
+
+model RateLimit {
+  id            String        @id @default(uuid())
+  type          RateLimitType @unique
+  remaining     Int
+  limit         Int          @default(5000)
+  reset         DateTime
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+}
+
+enum AnalysisStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum QueueStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum RateLimitType {
+  GITHUB_API
+  GITHUB_SEARCH
+  OPENAI_API
+  TWITTER_API
+}
+
+enum DependencyType {
+  PRODUCTION
+  DEVELOPMENT
 }
