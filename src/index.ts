@@ -1,9 +1,10 @@
-import dotenv from 'dotenv';
 import { LARPCheckApp } from './app';
+import { config } from 'dotenv';
+import path from 'path';
 import logger from './services/logger';
 
 // Load environment variables
-dotenv.config();
+config({ path: path.join(__dirname, '../.env') });
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -21,31 +22,32 @@ for (const envVar of requiredEnvVars) {
   }
 }
 
-async function main(): Promise<void> {
-  const app = new LARPCheckApp();
+logger.info('Starting app with Twitter credentials', {
+  username: process.env.TWITTER_USERNAME,
+  hasPassword: Boolean(process.env.TWITTER_PASSWORD)
+});
 
-  try {
-    await app.start({
-      username: process.env.TWITTER_USERNAME!,
-      password: process.env.TWITTER_PASSWORD!,
-    });
+const app = new LARPCheckApp();
 
-    // Handle graceful shutdown
-    process.on('SIGTERM', async () => {
-      logger.info('Received SIGTERM signal. Shutting down...');
-      await app.stop();
-      process.exit(0);
-    });
+// Start the application with Twitter credentials from environment variables
+app.start({
+  username: process.env.TWITTER_USERNAME!,
+  password: process.env.TWITTER_PASSWORD!
+}).catch(error => {
+  logger.error('Failed to start application:', error);
+  process.exit(1);
+});
 
-    process.on('SIGINT', async () => {
-      logger.info('Received SIGINT signal. Shutting down...');
-      await app.stop();
-      process.exit(0);
-    });
-  } catch (error) {
-    logger.error('Failed to start application:', error);
-    process.exit(1);
-  }
-}
+// Handle shutdown gracefully
+process.on('SIGINT', async () => {
+  logger.info('Received SIGINT signal. Shutting down...');
+  await app.stop();
+  process.exit(0);
+});
 
-main(); 
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('Received SIGTERM signal. Shutting down...');
+  await app.stop();
+  process.exit(0);
+}); 

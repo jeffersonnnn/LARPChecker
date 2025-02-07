@@ -1,4 +1,4 @@
-import { Scraper, Tweet, Profile } from 'agent-twitter-client';
+import { Scraper, Tweet, Profile, SearchMode } from 'agent-twitter-client';
 import { ITwitterService, ITwitterAuth, IMention, ISessionService } from '../types/interfaces';
 import { SessionService } from './session.service';
 import logger from './logger';
@@ -69,14 +69,25 @@ export class TwitterService implements ITwitterService {
 
   async authenticate(auth: ITwitterAuth): Promise<void> {
     try {
+      logger.info('Starting Twitter authentication', { username: auth.username });
       await this.scraper.login(auth.username, auth.password);
       this.isAuthenticated = true;
 
       // Save new session
       const newCookies = await this.scraper.getCookies();
+      logger.info('Got new cookies from Twitter', { cookieCount: newCookies.length });
       await this.sessionService.saveCookies(newCookies);
       
       logger.info('Authenticated with Twitter', { username: auth.username });
+
+      // Get profile to verify authentication
+      const profile = await this.scraper.me();
+      if (profile) {
+        this.username = profile.username;
+        logger.info('Successfully verified Twitter profile', { username: this.username });
+      } else {
+        logger.warn('Could not verify Twitter profile after authentication');
+      }
 
       // Start mention listener now that we're authenticated
       await this.startMentionListener();
@@ -144,11 +155,16 @@ export class TwitterService implements ITwitterService {
     if (this.pollInterval) {
       clearInterval(this.pollInterval);
       this.pollInterval = undefined;
-      logger.info('Stopped listening for mentions');
     }
+    if (this.mentionCheckInterval) {
+      clearInterval(this.mentionCheckInterval);
+      this.mentionCheckInterval = undefined;
+    }
+    logger.info('Stopped listening for mentions');
   }
 
   async startMentionListener(): Promise<void> {
+    logger.debug('Starting mention listener');
     try {
       if (!this.isAuthenticated) {
         logger.info('Twitter service not authenticated yet, mention listener will start after authentication');
@@ -180,58 +196,182 @@ export class TwitterService implements ITwitterService {
     }
   }
 
-  private async processMention(tweet: Tweet, profile: Profile): Promise<void> {
-    if (!this.isValidTweet(tweet) || !tweet.id || this.processedMentions.has(tweet.id)) {
+  private async checkMentions(): Promise<void> {
+    logger.debug('Checking mentions');
+    if (!this.username || !this.isAuthenticated) {
+      logger.debug('Skipping mention check - not authenticated or no username');
       return;
     }
 
-    try {
-      if (tweet.text && profile.username &&
-          tweet.text.includes('@' + profile.username) && 
-          tweet.text.includes('github.com')) {
+    let retries = 0;
+    const maxRetries = this.config.maxRetries;
+
+    while (retries < maxRetries) {
+      try {
+        await this.handleRateLimit();
         
+        const profile = await this.scraper.me();
+        if (!profile) {
+          throw new Error('Failed to fetch profile');
+        }
+
+        // Increase tweet fetch count and add timestamp logging
+        logger.info('Starting mention check', {
+          username: this.username,
+          timestamp: new Date().toISOString(),
+          lastProcessedTweet: Array.from(this.processedMentions)[0]
+        });
+
+        // Search for tweets mentioning the account - include both mentions and tweets to the account
+        const tweetsGenerator = this.scraper.searchTweets(`to:${this.username} OR @${this.username}`, 100, SearchMode.Latest);
+        const tweets = [];
+        let tweetCount = 0;
+        
+        for await (const tweet of tweetsGenerator) {
+          tweetCount++;
+          logger.debug('Processing tweet', { 
+            id: tweet.id,
+            text: tweet.text,
+            username: tweet.username || tweet.name,
+            timestamp: new Date().toISOString()
+          });
+          
+          if (this.isValidTweet(tweet)) {
+            tweets.push(tweet);
+          }
+        }
+
+        logger.info('Mention check summary', {
+          totalTweetsChecked: tweetCount,
+          validTweetsFound: tweets.length,
+          timestamp: new Date().toISOString()
+        });
+
+        for (const tweet of tweets) {
+          await this.processMention(tweet, profile).catch(error => {
+            logger.error('Error processing mention:', error);
+          });
+        }
+
+        break;
+      } catch (error) {
+        retries++;
+        logger.error(`Mention check failed (attempt ${retries}/${maxRetries}):`, error);
+        
+        if (this.isSessionError(error)) {
+          await this.handleSessionError();
+          break;
+        }
+        
+        if (retries < maxRetries) {
+          await new Promise(resolve => 
+            setTimeout(resolve, this.config.backoffTime * retries)
+          );
+        } else {
+          logger.error('Max retries reached for mention check');
+        }
+      }
+    }
+  }
+
+  private isValidTweet(tweet: Tweet): tweet is Tweet {
+    logger.info('Starting tweet validation', {
+        tweet_id: tweet?.id,
+        tweet_text: tweet?.text,
+        tweet_username: tweet?.username || tweet?.name
+    });
+
+    const hasRequiredFields = Boolean(
+        tweet &&
+        tweet.id &&
+        tweet.text &&
+        (tweet.username || tweet.name)
+    );
+
+    if (!hasRequiredFields || !tweet.text) {
+        logger.debug('Tweet missing required fields', { 
+            has_tweet: Boolean(tweet),
+            has_id: Boolean(tweet?.id),
+            has_text: Boolean(tweet?.text),
+            has_username: Boolean(tweet?.username || tweet?.name)
+        });
+        return false;
+    }
+
+    const tweetText = tweet.text.toLowerCase();
+    const hasMentionFormat = tweetText.includes(`@${this.username?.toLowerCase()}`) && 
+                            (tweetText.includes('analyze') || tweetText.includes('check'));
+    const githubUrl = this.extractGitHubUrl(tweet.text);
+    const hasGitHubUrl = Boolean(githubUrl);
+
+    logger.info('Tweet validation details', {
+        id: tweet.id,
+        text: tweet.text,
+        hasMentionFormat,
+        mentionFound: tweetText.includes(`@${this.username?.toLowerCase()}`),
+        hasAnalyzeOrCheck: tweetText.includes('analyze') || tweetText.includes('check'),
+        hasGitHubUrl,
+        githubUrl,
+        timestamp: new Date().toISOString()
+    });
+
+    return hasRequiredFields && hasMentionFormat && hasGitHubUrl;
+  }
+
+  private async processMention(tweet: Tweet, profile: Profile): Promise<void> {
+    if (!tweet.id || !tweet.text || this.processedMentions.has(tweet.id)) {
+      return;
+    }
+
+    let retries = 0;
+    while (retries < this.config.maxRetries) {
+      try {
+        const githubUrl = this.extractGitHubUrl(tweet.text);
+        if (!githubUrl) {
+          logger.debug('No valid GitHub URL found in mention', { text: tweet.text });
+          return;
+        }
+
         const mention: IMention = {
           id: tweet.id,
           text: tweet.text,
           author: tweet.username || tweet.name || 'unknown',
-          repositoryUrl: this.extractGitHubUrl(tweet.text),
+          repositoryUrl: githubUrl
         };
 
-        // Process mention through all registered callbacks
         for (const callback of this.mentionCallbacks) {
-          try {
-            await callback(mention);
-          } catch (error) {
-            logger.error('Error in mention callback:', error);
-          }
+          await callback(mention);
         }
 
-        // Cache the processed mention ID
         this.processedMentions.add(tweet.id);
         setTimeout(() => {
           if (tweet.id) {
             this.processedMentions.delete(tweet.id);
           }
         }, this.config.cacheTimeout);
+
+        break;
+      } catch (error) {
+        retries++;
+        if (retries === this.config.maxRetries) {
+          throw error;
+        }
+        await new Promise(resolve => 
+          setTimeout(resolve, this.config.backoffTime * retries)
+        );
       }
-    } catch (error) {
-      logger.error('Error processing mention:', error);
     }
   }
 
-  private isValidTweet(tweet: Tweet): tweet is Tweet {
-    return Boolean(
-      tweet &&
-      tweet.id &&
-      tweet.text &&
-      (tweet.username || tweet.name)
-    );
-  }
-
   private extractGitHubUrl(text: string): string | undefined {
-    const githubUrlRegex = /https?:\/\/github\.com\/[^\s/]+\/[^\s/]+/;
+    // Updated regex to handle more GitHub URL formats including www
+    const githubUrlRegex = /https?:\/\/(?:www\.)?github\.com\/[\w-]+\/[\w-]+(?:\/)?/i;
     const match = text.match(githubUrlRegex);
-    return match ? match[0] : undefined;
+    if (match) {
+      // Clean up the URL by removing trailing slashes and normalizing to non-www version
+      return match[0].replace(/\/$/, '').replace('www.github.com', 'github.com');
+    }
+    return undefined;
   }
 
   private isSessionError(error: any): boolean {
@@ -264,36 +404,5 @@ export class TwitterService implements ITwitterService {
     await this.sessionService.clearCookies();
     this.isAuthenticated = false;
     throw new Error('Session expired, please authenticate again');
-  }
-
-  private async checkMentions(): Promise<void> {
-    if (!this.username || !this.isAuthenticated) return;
-
-    await this.handleRateLimit();
-    const tweetsGenerator = await this.scraper.getTweetsAndReplies(this.username, 10);
-    const tweets = [];
-    
-    for await (const tweet of tweetsGenerator) {
-      if (this.isValidTweet(tweet)) {
-        tweets.push(tweet);
-      }
-    }
-    
-    const profile = await this.scraper.me();
-    if (!profile) {
-      logger.warn('Could not get profile for processing mentions');
-      return;
-    }
-
-    for (const tweet of tweets) {
-      await this.processMention(tweet, profile);
-    }
-  }
-
-  private stopMentionListener(): void {
-    if (this.mentionCheckInterval) {
-      clearInterval(this.mentionCheckInterval);
-      this.mentionCheckInterval = undefined;
-    }
   }
 } 
